@@ -33,17 +33,21 @@ let inLink = false;
 
 // Classify an inline HTML tag: 'open' for <a ...>, 'close' for </a ...>,
 // null otherwise (case-insensitive; <abbr> is not <a>).
+// Whether an HTML tag opens/closes the inLink state, per marked's
+// other.startATag (/^<a /i) and other.endATag (/^<\/a>/i):
+// an opening <a> needs a literal SPACE after the `a` (a bare `<a>`
+// does NOT set inLink), and a closing tag must be exactly `</a>`.
 function anchorTagKind(tag) {
-  let k = 1, close = false;
-  if (tag.charCodeAt(1) === C_SLASH) { close = true; k = 2; }
-  if (k >= tag.length) return null;
-  const c = tag.charCodeAt(k);
-  if (c !== 97 && c !== 65) return null;
-  if (k + 1 >= tag.length) return null;
-  const nx = tag.charCodeAt(k + 1);
-  if (nx === C_SPACE || nx === C_TAB || nx === C_LF || nx === C_CR || nx === C_GT || nx === C_SLASH) {
-    return close ? 'close' : 'open';
+  if (tag.length < 3) return null;
+  const c0 = tag.charCodeAt(0);
+  if (c0 !== C_LT) return null;
+  if (tag.charCodeAt(1) === C_SLASH) {
+    // </a> exactly
+    if (tag.length >= 4 && (tag.charCodeAt(2) === 97 || tag.charCodeAt(2) === 65) && tag.charCodeAt(3) === C_GT) return 'close';
+    return null;
   }
+  // <a + literal space
+  if ((tag.charCodeAt(1) === 97 || tag.charCodeAt(1) === 65) && tag.charCodeAt(2) === C_SPACE) return 'open';
   return null;
 }
 
@@ -673,7 +677,14 @@ function tryLink(s, i, refs, isImage) {
     const alt = renderAltText(labelText);
     return { node: { t: 4, src: href, title, alt, p: i - 1 }, end: j };
   }
+  // marked's De(): the label is tokenized with inLink forced true
+  // (autolinks inside a link label are suppressed), and the outer
+  // inLink state is restored afterwards so a `<a>`/`</a>` inside the
+  // label does not leak into the surrounding paragraph (doc-04/06/35)
+  const savedInLink = inLink;
+  inLink = true;
   const children = tokenizeInline(labelText, refs, true);
+  inLink = savedInLink;
   processEmphasis(children);
   // links cannot nest: if the label itself contains a link, the outer
   // link is not formed
@@ -695,8 +706,12 @@ function containsLink(nodes) {
 
 // Render image alt text: the label parsed as inline, then all tags stripped.
 // Entities and escapes are resolved; emphasis/links contribute their text.
+// (inLink is saved/restored around the label tokenization, as in De().)
 function renderAltText(labelText) {
+  const savedInLink = inLink;
+  inLink = true;
   const nodes = tokenizeInline(labelText, new Map());
+  inLink = savedInLink;
   let out = '';
   const walk = (ns) => {
     for (const nd of ns) {
@@ -2808,7 +2823,15 @@ function parseBlocks(lines, refs, lazy, topLevel, endsNl, inList) {
         i = j + 1;
         continue;
       }
-      out.push({ k: 'p', text: paraLines.join('\n') });
+      // Top-level paragraphs are tokenized HERE (in document order),
+      // not deferred to renderBlocks: marked lexes inline in document
+      // order, and the `inLink` flag (unclosed <a> suppressing later
+      // autolinks) must see earlier blocks first (doc-03/04/06/30/35).
+      // Nested paragraphs keep the raw-text token (blockquote chunk
+      // merging and tight-list textTokenText need it, and those render
+      // during parseBlocks anyway, so they are already in order).
+      if (topLevel) out.push({ k: 'x', s: '<p>' + parseInline(paraLines.join('\n'), refs) + '</p>\n' });
+      else out.push({ k: 'p', text: paraLines.join('\n') });
       i = j;
       continue;
     }
