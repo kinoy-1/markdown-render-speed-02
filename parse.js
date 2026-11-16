@@ -18,7 +18,7 @@
 const C_SPACE = 32, C_TAB = 9, C_LF = 10, C_CR = 13;
 const C_LT = 60, C_GT = 62, C_AMP = 38, C_QUOT = 34, C_SQ = 39;
 const C_BSLASH = 92, C_BTICK = 96, C_STAR = 42, C_UNDER = 95;
-const C_TILDE = 126, C_LBR = 91, C_RBR = 93, C_LP = 40;
+const C_TILDE = 126, C_LBR = 91, C_RBR = 93, C_LP = 40, C_PLUS = 43;
 const C_RP = 41, C_BANG = 33, C_HASH = 35, C_DASH = 45;
 const C_DOT = 46, C_COLON = 58, C_SLASH = 47, C_AT = 64;
 
@@ -565,7 +565,7 @@ function resolveEscapesEntities(s) {
 
 // Find the index of the matching ']' for the '[' at s[i], scanning inline
 // content (nested brackets and code spans are honoured). Returns -1.
-function findLinkEnd(s, i) {
+function findLinkEnd(s, i, strict) {
   const n = s.length;
   let depth = 1;
   let j = i + 1;
@@ -581,6 +581,11 @@ function findLinkEnd(s, i) {
       // backtick run of ANY length. If there is no later backtick run,
       // the label cannot match and the link FAILS — unless the run is
       // 2+ backticks immediately before `]` (``+(?=])).
+      // STRICT (masking only): marked's blockSkip link regex uses
+      // \k<a>, so a code-span pair must have MATCHING run lengths; a
+      // mismatched pair means the link is not masked at all (doc-16:
+      // `[values ``guide` in](#should)` is not masked, so the spanning
+      // code span from the lone ` after guide masks the `*...*`).
       if (run >= 2 && k < n && s.charCodeAt(k) === C_RBR) { j = k; continue; }
       // The closer run must appear BEFORE the label's closing `]`
       // (doc-23: a backtick after the `]` is not a closer). Scan for
@@ -595,8 +600,10 @@ function findLinkEnd(s, i) {
         if (mc === C_BTICK) {
           let q = m;
           while (q < n && s.charCodeAt(q) === C_BTICK) q++;
-          found = q;
-          break;
+          if (!strict || q - m === run) { found = q; break; }
+          // strict: a run of a different length is content, keep scanning
+          m = q;
+          continue;
         }
         if (mc === C_LBR) d++;
         else if (mc === C_RBR) { d--; if (d === 0) return -1; }
@@ -1192,7 +1199,12 @@ function tryStrikethrough(s, i, j, refs, noExt) {
       while (q < n && s.charCodeAt(q) === C_TILDE) q++;
       if (q - k === run) {
         const afterOk = q >= n || s.charCodeAt(q) !== C_TILDE;
-        const beforeCh = k > 0 ? s.charCodeAt(k - 1) : C_SPACE;
+        let beforeCh = k > 0 ? s.charCodeAt(k - 1) : C_SPACE;
+        // an escaped tilde right before the run (e.g. `~~run \~~~`:
+        // the `\~` is a literal ~, the `~~` after it is the closer)
+        // counts as a punct char, not a tilde, in marked's masked
+        // source (`\~` -> `++`), so it must not block canClose
+        if (beforeCh === C_TILDE && k >= 2 && s.charCodeAt(k - 2) === C_BSLASH) beforeCh = C_PLUS;
         const afterCh = q < n ? s.charCodeAt(q) : C_SPACE;
         const canOpen = !isSpaceCh(afterCh) && afterCh !== C_TILDE;
         const canClose = !isSpaceCh(beforeCh) && beforeCh !== C_TILDE && afterOk;
@@ -1443,7 +1455,11 @@ function maskForEm(s, refs) {
       // whose code span had mismatched backtick runs still resolves
       // here (doc-16/20/23: the construct masks even though the link
       // itself is rejected by the stricter label regex at formation).
-      const close = findLinkEnd(m1, i);
+      // STRICT: the label's code spans must have matching run lengths
+      // (marked's blockSkip \k<a>); a mismatched pair means the link
+      // is not masked, and the spanning code span masks instead
+      // (doc-16: `[values ``guide` in](#should)`).
+      const close = findLinkEnd(m1, i, true);
       if (close !== -1) {
         // marked's blockSkip link regex cannot match a label containing
         // nested brackets, so such a construct is NOT masked (its `*`
