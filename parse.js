@@ -1327,21 +1327,19 @@ function rewindNodes(nodes, localStart) {
   }
 }
 
-// Length-preserving mask of code spans / HTML tags / LINKS for emStrong
-// scanning (marked's #n + blockSkip): a delimiter inside a code span,
-// an HTML tag, or a real link is not a possible emphasis closer, so the
-// masked source replaces those spans with `[aaa...]` (same length, so
-// indices still align). Only VALID links are masked — a bare `[text]`
-// that is not a link must not hide its `*`/`_` (cm-523).
-function maskForEm(s, refs) {
+// Pass 1 of maskForEm (marked's anyPunctuationOutsideCode / Ot):
+// escaped punct `\X` -> `++`; inside a code span, backtick runs that
+// are NOT the delimiter become `+` (so a span like `` `` a ` b `` ``
+// has consistent 2-backtick delimiters afterwards). Delimiters are
+// kept. Length-preserving, so indices still align with the raw source.
+// Only applied when a matching closer exists.
+function otNormalize(s) {
   const n = s.length;
   const out = s.split('');
   let i = 0;
   while (i < n) {
     const c = s.charCodeAt(i);
     if (c === C_BSLASH && i + 1 < n && isPunctCh(s.charCodeAt(i + 1))) {
-      // escaped punctuation (marked's anyPunctuationOutsideCode): the
-      // `\*` is not a delimiter, so mask both chars as `+` (cm-437/440)
       out[i] = '+'; out[i + 1] = '+';
       i += 2;
       continue;
@@ -1351,10 +1349,55 @@ function maskForEm(s, refs) {
       while (j < n && s.charCodeAt(j) === C_BTICK) j++;
       const run = j - i;
       let k = j, close = -1;
+      const inner = [];
       while (k < n) {
         if (s.charCodeAt(k) === C_BTICK) {
           let q = k;
           while (q < n && s.charCodeAt(q) === C_BTICK) q++;
+          if (q - k === run) { close = q; break; }
+          for (let m = k; m < q; m++) inner.push(m);
+          k = q;
+        } else k++;
+      }
+      if (close !== -1) {
+        for (const m of inner) out[m] = '+';
+        i = close;
+        continue;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return out.join('');
+}
+
+// Length-preserving mask of code spans / HTML tags / LINKS for emStrong
+// scanning (marked's #n + blockSkip): a delimiter inside a code span,
+// an HTML tag, or a real link is not a possible emphasis closer, so the
+// masked source replaces those spans with `[aaa...]` (same length, so
+// indices still align). Only VALID links are masked — a bare `[text]`
+// that is not a link must not hide its `*`/`_` (cm-523).
+// Two passes, like marked: pass 1 Ot-normalizes backticks (so a link
+// label whose code span has mismatched backtick runs still masks —
+// doc-16/20/23), pass 2 masks code spans / links / HTML on the
+// normalized text.
+function maskForEm(s, refs) {
+  const m1 = otNormalize(s);
+  const n = m1.length;
+  const out = m1.split('');
+  let i = 0;
+  while (i < n) {
+    const c = m1.charCodeAt(i);
+    if (c === C_BTICK) {
+      let j = i;
+      while (j < n && m1.charCodeAt(j) === C_BTICK) j++;
+      const run = j - i;
+      let k = j, close = -1;
+      while (k < n) {
+        if (m1.charCodeAt(k) === C_BTICK) {
+          let q = k;
+          while (q < n && m1.charCodeAt(q) === C_BTICK) q++;
           if (q - k === run) { close = q; break; }
           k = q;
         } else k++;
@@ -1370,7 +1413,7 @@ function maskForEm(s, refs) {
       continue;
     }
     if (c === C_LT) {
-      const te = htmlTagEnd(s, i);
+      const te = htmlTagEnd(m1, i);
       if (te !== -1) {
         out[i] = '[';
         for (let m = i + 1; m < te - 1; m++) out[m] = 'a';
@@ -1379,7 +1422,7 @@ function maskForEm(s, refs) {
         continue;
       }
       // <...> autolink (cm-480: `**` inside <https://...?q=**> is masked)
-      const al = tryAutolink(s, i);
+      const al = tryAutolink(m1, i);
       if (al) {
         out[i] = '[';
         for (let m = i + 1; m < al.end - 1; m++) out[m] = 'a';
@@ -1396,7 +1439,11 @@ function maskForEm(s, refs) {
       // outside it (cm-473/474). Mask the whole construct as [aaa...]
       // — but ONLY if it is a valid link (a bare [text] that resolves
       // to nothing is not a link, cm-523, and must not hide its `*`).
-      const close = findLinkEnd(s, i);
+      // Note: findLinkEnd runs on the Ot-normalized text, so a label
+      // whose code span had mismatched backtick runs still resolves
+      // here (doc-16/20/23: the construct masks even though the link
+      // itself is rejected by the stricter label regex at formation).
+      const close = findLinkEnd(m1, i);
       if (close !== -1) {
         // marked's blockSkip link regex cannot match a label containing
         // nested brackets, so such a construct is NOT masked (its `*`
@@ -1404,25 +1451,25 @@ function maskForEm(s, refs) {
         // separately when the scan reaches it — cm-519, doc-13)
         let nested = false;
         for (let m = i + 1; m < close; m++) {
-          if (s.charCodeAt(m) === C_BSLASH) { m++; continue; }
-          if (s.charCodeAt(m) === C_LBR) { nested = true; break; }
+          if (m1.charCodeAt(m) === C_BSLASH) { m++; continue; }
+          if (m1.charCodeAt(m) === C_LBR) { nested = true; break; }
         }
         if (nested) { i++; continue; }
         let end = -1;
         let j = close + 1;
-        while (j < n && isSpaceCh(s.charCodeAt(j))) j++;
-        if (j < n && s.charCodeAt(j) === C_LP) {
-          const p = parseLinkParens(s, j);
+        while (j < n && isSpaceCh(m1.charCodeAt(j))) j++;
+        if (j < n && m1.charCodeAt(j) === C_LP) {
+          const p = parseLinkParens(m1, j);
           if (p) end = p.end;
-        } else if (j < n && s.charCodeAt(j) === C_LBR) {
-          const lc = s.indexOf(']', j + 1);
+        } else if (j < n && m1.charCodeAt(j) === C_LBR) {
+          const lc = m1.indexOf(']', j + 1);
           if (lc !== -1) {
-            const lab = lc === j + 1 ? s.slice(i + 1, close) : s.slice(j + 1, lc);
+            const lab = lc === j + 1 ? m1.slice(i + 1, close) : m1.slice(j + 1, lc);
             if (!hasUnescapedBracket(lab) && refs && refs.get(normalizeLabel(lab))) end = lc + 1;
           }
         } else {
           // shortcut reference: only a link if the label resolves
-          const lab = s.slice(i + 1, close);
+          const lab = m1.slice(i + 1, close);
           if (!hasUnescapedBracket(lab) && refs && refs.get(normalizeLabel(lab))) end = close + 1;
         }
         if (end !== -1) {
