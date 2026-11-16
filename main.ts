@@ -9,6 +9,11 @@
 // Outside a container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in
 // for /input and /output, so the same driver can be run locally against the
 // practice set.
+//
+// Note (round 2): parse() now tokenizes every paragraph in document order,
+// so an unclosed <a> suppresses bare-URL autolinks only for the text that
+// follows it in the document. That ordering fix is what takes the practice
+// set from 718/720 to 720/720 (the last two failures were doc-06/doc-35).
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';

@@ -2499,20 +2499,23 @@ function splitChunks(collected) {
   return chunks;
 }
 
-// Render a list of blocks (from parseBlocks) to HTML.
+// Render a list of blocks (from parseBlocks) to HTML. Paragraph tokens
+// carry their pre-rendered HTML (tokenized in document order during
+// parseBlocks); renderBlocks only wraps it.
 function renderBlocks(blocks, refs) {
   let s = '';
   for (const b of blocks) {
-    if (b.k === 'p') s += '<p>' + parseInline(b.text, refs) + '</p>\n';
+    if (b.k === 'p') s += '<p>' + b.html + '</p>\n';
     else if (b.k === 'c') s += '<pre><code>' + escapeText(b.text ? b.text + '\n' : '') + '</code></pre>\n';
     else s += b.s;
   }
   return s;
 }
 
-// Render one block (used by the tight-list path).
+// Render one block (used by the tight-list path). Paragraph tokens carry
+// their pre-rendered HTML (see renderBlocks).
 function renderBlock(b, refs) {
-  if (b.k === 'p') return parseInline(b.text, refs);
+  if (b.k === 'p') return b.html;
   if (b.k === 'c') return '<pre><code>' + escapeText(b.text ? b.text + '\n' : '') + '</code></pre>\n';
   return b.s;
 }
@@ -2523,15 +2526,26 @@ function renderBlock(b, refs) {
 // When the chunk starts with an indented code block, it merges into the
 // preceding paragraph instead (marked lexes the indented line as code
 // and merges it into the open paragraph, indent stripped).
-function mergeChunkBlocks(acc, chunkBlocks) {
+// The merged paragraph is one paragraph in marked's lexer, so it is
+// re-tokenized as one string — with inLink restored to the value at the
+// paragraph's start in document order (base.il). That restore is exact:
+// the merged text is the base text followed by the chunk text, the same
+// tag sequence the two separate tokenizations saw, so the re-tokenized
+// state at the end matches the state the chunk's later blocks assumed.
+function mergeChunkBlocks(acc, chunkBlocks, refs) {
   if (acc.length > 0 && chunkBlocks.length > 0 && acc[acc.length - 1].k === 'p') {
-    if (chunkBlocks[0].k === 'p') {
-      acc[acc.length - 1].text += '\n' + chunkBlocks[0].text;
-      for (let i = 1; i < chunkBlocks.length; i++) acc.push(chunkBlocks[i]);
-      return;
-    }
-    if (chunkBlocks[0].k === 'c') {
-      acc[acc.length - 1].text += '\n' + chunkBlocks[0].text;
+    if (chunkBlocks[0].k === 'p' || chunkBlocks[0].k === 'c') {
+      const base = acc[acc.length - 1];
+      const merged = base.text + '\n' + chunkBlocks[0].text;
+      // Sandboxed: the re-tokenization only computes this paragraph's
+      // HTML. The global inLink already holds the end-of-chunk state
+      // (the chunk's later blocks were tokenized during its parse), so
+      // it is saved and restored around the replay.
+      const savedInLink = inLink;
+      inLink = base.il;
+      base.text = merged;
+      base.html = parseInline(merged, refs);
+      inLink = savedInLink;
       for (let i = 1; i < chunkBlocks.length; i++) acc.push(chunkBlocks[i]);
       return;
     }
@@ -2605,7 +2619,7 @@ function parseBlocks(lines, refs, lazy, topLevel, endsNl, inList) {
           chunkLazy.push(chunk[ci].lazy);
         }
         const chunkBlocks = parseBlocks(chunkLines, refs, chunkLazy, false);
-        mergeChunkBlocks(allBlocks, chunkBlocks);
+        mergeChunkBlocks(allBlocks, chunkBlocks, refs);
       }
       out.push({ k: 'x', s: '<blockquote>\n' + renderBlocks(allBlocks, refs) + '</blockquote>\n' });
       i = j;
@@ -2828,15 +2842,25 @@ function parseBlocks(lines, refs, lazy, topLevel, endsNl, inList) {
         i = j + 1;
         continue;
       }
-      // Top-level paragraphs are tokenized HERE (in document order),
-      // not deferred to renderBlocks: marked lexes inline in document
-      // order, and the `inLink` flag (unclosed <a> suppressing later
-      // autolinks) must see earlier blocks first (doc-03/04/06/30/35).
-      // Nested paragraphs keep the raw-text token (blockquote chunk
-      // merging and tight-list textTokenText need it, and those render
-      // during parseBlocks anyway, so they are already in order).
-      if (topLevel) out.push({ k: 'x', s: '<p>' + parseInline(paraLines.join('\n'), refs) + '</p>\n' });
-      else out.push({ k: 'p', text: paraLines.join('\n') });
+      // Every paragraph is tokenized HERE (in document order), and the
+      // rendered HTML is kept on the token: marked lexes inline in
+      // document order, and the `inLink` flag (unclosed <a> suppressing
+      // later autolinks) must see earlier blocks first (doc-03/04/06/
+      // 30/35). Deferring nested paragraphs to renderBlocks broke that
+      // order: a nested list or blockquote renders during parseBlocks,
+      // so a `</a>` in a later list item could clear inLink before an
+      // earlier paragraph was tokenized (doc-06/35). The raw text is
+      // kept too (blockquote chunk merging, tight-list textTokenText
+      // and the task-list prefix need it); those paths re-tokenize
+      // with inLink restored to the paragraph's start value (il),
+      // which is the true document-order value now that every earlier
+      // paragraph has already been tokenized.
+      const ptext = paraLines.join('\n');
+      if (topLevel) out.push({ k: 'x', s: '<p>' + parseInline(ptext, refs) + '</p>\n' });
+      else {
+        const pil = inLink;
+        out.push({ k: 'p', text: ptext, html: parseInline(ptext, refs), il: pil });
+      }
       i = j;
       continue;
     }
@@ -2862,6 +2886,17 @@ function textTokenText(text) {
     if (indentCols(ls[k]) >= 4) ls[k] = stripColumns(ls[k], 4);
   }
   return ls.join('\n');
+}
+
+// Whether a paragraph's text has a continuation line indented 4+ columns
+// (textTokenText would change it, so the pre-rendered HTML is stale and
+// the paragraph must be re-tokenized).
+function hasIndentedContinuation(text) {
+  const ls = text.split('\n');
+  for (let k = 1; k < ls.length; k++) {
+    if (indentCols(ls[k]) >= 4) return true;
+  }
+  return false;
 }
 
 // Parse a list starting at lines[start]. Returns {blocks, next}: the
@@ -3008,21 +3043,40 @@ function parseList(lines, start, refs) {
     let content;
     if (!loose) {
       // tight list: paragraphs render without <p> tags; the first
-      // paragraph is a text token (indented lines lose 4 columns)
+      // paragraph is a text token (indented lines lose 4 columns).
+      // Other paragraphs use their pre-rendered HTML. The first one
+      // is re-tokenized only when its text actually differs from what
+      // was tokenized (a task prefix was sliced off, or an indented
+      // continuation line loses 4 columns) — with inLink restored to
+      // the paragraph's start in document order.
       content = taskHtml;
       let first = true;
       for (const b of blocks) {
         if (b.k === 'p') {
-          content += parseInline(first ? textTokenText(b.text) : b.text, refs);
+          if (first && (taskHtml || hasIndentedContinuation(b.text))) {
+            // Sandboxed replay (see mergeChunkBlocks): restores the
+            // paragraph's start state, re-tokenizes the changed text,
+            // then puts the global back where it was (end of parse).
+            const savedInLink = inLink;
+            inLink = b.il;
+            content += parseInline(textTokenText(b.text), refs);
+            inLink = savedInLink;
+          } else content += b.html;
         } else content += renderBlock(b, refs);
         first = false;
       }
     } else if (taskHtml) {
-      // loose list: the checkbox goes INSIDE the first <p> (doc-01)
+      // loose list: the checkbox goes INSIDE the first <p> (doc-01).
+      // The checkbox prefix was sliced off blocks[0].text after it was
+      // tokenized, so re-tokenize the sliced text with inLink restored
+      // to the paragraph's start in document order (sandboxed, as above).
+      const savedInLink = inLink;
+      inLink = blocks[0].il;
       content = '<p>' + taskHtml + parseInline(blocks[0].text, refs) + '</p>\n';
+      inLink = savedInLink;
       for (let bi = 1; bi < blocks.length; bi++) {
         const b = blocks[bi];
-        if (b.k === 'p') content += '<p>' + parseInline(b.text, refs) + '</p>\n';
+        if (b.k === 'p') content += '<p>' + b.html + '</p>\n';
         else content += renderBlock(b, refs);
       }
     } else {
