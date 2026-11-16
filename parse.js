@@ -1239,6 +1239,62 @@ function tryStrikethrough(s, i, j, refs, noExt) {
 
 // Compute canOpen/canClose for a delimiter run at s[start..end) of char ch.
 // A boundary counts as whitespace (CommonMark reference behaviour).
+// ---- marked 18.1.3 emStrong port (GFM) ----
+// Character classes (marked's $/j/X for _; ye/st/it for * in GFM).
+const EM_PUNCT = '[\\p{P}\\p{S}]';
+const EM_PUNCT_SPACE = '[\\s\\p{P}\\p{S}]';
+const EM_NOT_PUNCT_SPACE = '[^\\s\\p{P}\\p{S}]';
+const EM_PUNCT_GFM = '(?!~)[\\p{P}\\p{S}]';
+const EM_PUNCT_SPACE_GFM = '(?!~)[\\s\\p{P}\\p{S}]';
+const EM_NOT_PUNCT_SPACE_GFM = '(?:[^\\s\\p{P}\\p{S}]|~)';
+// LDelim template _e with the GFM punct class (ye).
+const EM_LDELIM = new RegExp(
+  '^(?:\\*+(?:((?!\\*)PUNCT)|([^\\s*]))?)|^_+(?:((?!_)PUNCT)|([^\\s_]))?'
+    .replace(/PUNCT/g, EM_PUNCT_GFM),
+  'u'
+);
+// RDelimAst template $e with GFM classes (it/st/ye) — marked's ht.
+const EM_RDELIM_AST = new RegExp(
+  '^[^_*]*?__[^_*]*?\\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\\*)punct(\\*+)(?=[\\s]|$)|notPunctSpace(\\*+)(?!\\*)(?=punctSpace|$)|(?!\\*)punctSpace(\\*+)(?=notPunctSpace)|[\\s](\\*+)(?!\\*)(?=punct)|(?!\\*)punct(\\*+)(?!\\*)(?=punct)|notPunctSpace(\\*+)(?=notPunctSpace)'
+    .replace(/notPunctSpace/g, EM_NOT_PUNCT_SPACE_GFM)
+    .replace(/punctSpace/g, EM_PUNCT_SPACE_GFM)
+    .replace(/punct/g, EM_PUNCT_GFM),
+  'gu'
+);
+// RDelimUnd template kt with the plain classes (X/j/$) — marked's kt.
+// NOTE: in GFM mode marked uses kt (not mt) for `_`: kt has NO group-6
+// alternative, so a `_` preceded by punct and followed by a letter is an
+// OPENER (group 3), not a closer (cm-372: `_(_foo)` stays literal).
+const EM_RDELIM_UND = new RegExp(
+  '^[^_*]*?\\*\\*[^_*]*?_[^_*]*?(?=\\*\\*)|[^_]+(?=[^_])|(?!_)punct(_+)(?=[\\s]|$)|notPunctSpace(_+)(?!_)(?=punctSpace|$)|(?!_)punctSpace(_+)(?=notPunctSpace)|[\\s](_+)(?!_)(?=punct)|(?!_)punct(_+)(?!_)(?=punct)'
+    .replace(/notPunctSpace/g, EM_NOT_PUNCT_SPACE)
+    .replace(/punctSpace/g, EM_PUNCT_SPACE)
+    .replace(/punct/g, EM_PUNCT),
+  'gu'
+);
+const EM_ALPHA_NUM = /[\p{L}\p{N}]/u;
+// marked's inline punctuation regex (single char): whitespace/punct/symbol
+// but not * or _.
+function isPunctSpaceCh(ch) {
+  if (!ch || ch === '*' || ch === '_') return false;
+  return /[\s\p{P}\p{S}]/u.test(ch);
+}
+// marked's fe(): last index in `src` of a delimiter run of `ch` whose
+// preceding char is not whitespace (the last position a closer can be).
+function emLastCloser(src, ch) {
+  let last = -1;
+  const n = src.length;
+  for (let s = 0; s < n; s++) {
+    if (src[s] !== ch) continue;
+    const o = s === 0 ? '\n' : src[s - 1];
+    let i = s + 1;
+    while (i < n && src[i] === ch) i++;
+    if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') last = s;
+    s = i - 1;
+  }
+  return last;
+}
+
 function flanking(s, start, end) {
   const n = s.length;
   const before = start > 0 ? s.charCodeAt(start - 1) : -1;
@@ -1271,6 +1327,185 @@ function rewindNodes(nodes, localStart) {
   }
 }
 
+// Length-preserving mask of code spans / HTML tags / LINKS for emStrong
+// scanning (marked's #n + blockSkip): a delimiter inside a code span,
+// an HTML tag, or a real link is not a possible emphasis closer, so the
+// masked source replaces those spans with `[aaa...]` (same length, so
+// indices still align). Only VALID links are masked — a bare `[text]`
+// that is not a link must not hide its `*`/`_` (cm-523).
+function maskForEm(s, refs) {
+  const n = s.length;
+  const out = s.split('');
+  let i = 0;
+  while (i < n) {
+    const c = s.charCodeAt(i);
+    if (c === C_BSLASH && i + 1 < n && isPunctCh(s.charCodeAt(i + 1))) {
+      // escaped punctuation (marked's anyPunctuationOutsideCode): the
+      // `\*` is not a delimiter, so mask both chars as `+` (cm-437/440)
+      out[i] = '+'; out[i + 1] = '+';
+      i += 2;
+      continue;
+    }
+    if (c === C_BTICK) {
+      let j = i;
+      while (j < n && s.charCodeAt(j) === C_BTICK) j++;
+      const run = j - i;
+      let k = j, close = -1;
+      while (k < n) {
+        if (s.charCodeAt(k) === C_BTICK) {
+          let q = k;
+          while (q < n && s.charCodeAt(q) === C_BTICK) q++;
+          if (q - k === run) { close = q; break; }
+          k = q;
+        } else k++;
+      }
+      if (close !== -1) {
+        out[i] = '[';
+        for (let m = i + 1; m < close - 1; m++) out[m] = 'a';
+        out[close - 1] = ']';
+        i = close;
+        continue;
+      }
+      i = j;
+      continue;
+    }
+    if (c === C_LT) {
+      const te = htmlTagEnd(s, i);
+      if (te !== -1) {
+        out[i] = '[';
+        for (let m = i + 1; m < te - 1; m++) out[m] = 'a';
+        out[te - 1] = ']';
+        i = te;
+        continue;
+      }
+      // <...> autolink (cm-480: `**` inside <https://...?q=**> is masked)
+      const al = tryAutolink(s, i);
+      if (al) {
+        out[i] = '[';
+        for (let m = i + 1; m < al.end - 1; m++) out[m] = 'a';
+        out[al.end - 1] = ']';
+        i = al.end;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (c === C_LBR) {
+      // a link [text](dest) / [text][label] / [text]: its text (and
+      // destination) cannot contain an emphasis closer for an opener
+      // outside it (cm-473/474). Mask the whole construct as [aaa...]
+      // — but ONLY if it is a valid link (a bare [text] that resolves
+      // to nothing is not a link, cm-523, and must not hide its `*`).
+      const close = findLinkEnd(s, i);
+      if (close !== -1) {
+        // marked's blockSkip link regex cannot match a label containing
+        // nested brackets, so such a construct is NOT masked (its `*`
+        // stays visible to emStrong, and the inner link is masked
+        // separately when the scan reaches it — cm-519, doc-13)
+        let nested = false;
+        for (let m = i + 1; m < close; m++) {
+          if (s.charCodeAt(m) === C_BSLASH) { m++; continue; }
+          if (s.charCodeAt(m) === C_LBR) { nested = true; break; }
+        }
+        if (nested) { i++; continue; }
+        let end = -1;
+        let j = close + 1;
+        while (j < n && isSpaceCh(s.charCodeAt(j))) j++;
+        if (j < n && s.charCodeAt(j) === C_LP) {
+          const p = parseLinkParens(s, j);
+          if (p) end = p.end;
+        } else if (j < n && s.charCodeAt(j) === C_LBR) {
+          const lc = s.indexOf(']', j + 1);
+          if (lc !== -1) {
+            const lab = lc === j + 1 ? s.slice(i + 1, close) : s.slice(j + 1, lc);
+            if (!hasUnescapedBracket(lab) && refs && refs.get(normalizeLabel(lab))) end = lc + 1;
+          }
+        } else {
+          // shortcut reference: only a link if the label resolves
+          const lab = s.slice(i + 1, close);
+          if (!hasUnescapedBracket(lab) && refs && refs.get(normalizeLabel(lab))) end = close + 1;
+        }
+        if (end !== -1) {
+          out[i] = '[';
+          for (let m = i + 1; m < end - 1; m++) out[m] = 'a';
+          out[end - 1] = ']';
+          i = end;
+          continue;
+        }
+      }
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return out.join('');
+}
+
+// Port of marked 18.1.3 Tokenizer.emStrong (GFM). Tries to match an
+// em/strong pair starting at position `i` in `s` (s[i] is * or _).
+// `masked` is the length-preserving masked source (code spans / HTML
+// tags replaced by [aaa...]) used for the closer scan and ze().
+// Returns {node, end} (node t:7 em / t:8 strong, end = index just past
+// the closer) or null. The inner text is re-tokenized recursively.
+function emStrongMatch(s, i, masked, refs, noExt) {
+  const e = s.slice(i);
+  const t = masked;
+  let n = i > 0 ? s[i - 1] : '';
+  EM_LDELIM.lastIndex = 0;
+  const m0 = EM_LDELIM.exec(e);
+  if (!m0 || (!m0[1] && !m0[2] && !m0[3] && !m0[4])) return null;
+  const r = m0[0][0];
+  const o = n === r;
+  const pos = t.length - e.length;
+  let l = pos;
+  while (l > 0 && t[l - 1] === r) l--;
+  const p = [...t.slice(Math.max(0, l - 2), l)].at(-1) ?? '';
+  const h = p === '*' || p === '_' || isPunctSpaceCh(p);
+  if (l < pos) n = p;
+  const u = l < pos ? h : isPunctSpaceCh(n);
+  if (m0[4] && EM_ALPHA_NUM.test(n)) return null;
+  const d = m0[1] || m0[3] || '';
+  if (!d || !n || u) {
+    const k = m0[0].length - 1;
+    let m = k, f = 0;
+    const y = pos - l + k;
+    const R = !!p.trim() && (!!d || (r === '*' && !h));
+    if (r !== '*' && r !== '_') return null;
+    const A = r === '*' ? EM_RDELIM_AST : EM_RDELIM_UND;
+    const v = emLastCloser(t, r);
+    const Q = t.length - e.length + k;
+    if (v < Q) return null;
+    const sliced = t.slice(-1 * e.length + k);
+    const ee = v - Q;
+    A.lastIndex = 0;
+    let sm;
+    while ((sm = A.exec(sliced)) !== null && !(sm.index > ee)) {
+      const g = sm[1] || sm[2] || sm[3] || sm[4] || sm[5] || sm[6];
+      if (!g) continue;
+      const b = [...g].length;
+      if (sm[3] || sm[4]) { m += b; continue; }
+      else if (sm[5] || sm[6] || R) {
+        if (o && (sm[5] || sm[6])) break;
+        if (y % 3 && !((y + b) % 3)) { f += b; continue; }
+      }
+      m -= b;
+      if (m > 0) continue;
+      const bb = Math.min(b, b + m + f);
+      const te = [...sm[0]][0].length;
+      const M = e.slice(0, k + sm.index + te + bb);
+      if (Math.min(k, bb) % 2) {
+        const U = M.slice(1, -1);
+        const children = tokenizeInline(U, refs, noExt);
+        return { node: { t: 7, children }, end: i + M.length };
+      }
+      const ne = M.slice(2, -2);
+      const children = tokenizeInline(ne, refs, noExt);
+      return { node: { t: 8, children }, end: i + M.length };
+    }
+  }
+  return null;
+}
+
 // Tokenize inline text into nodes. refs: Map<label, {href, title}>.
 // noExt disables the extended autolinks (bare URL / www / email /
 // mailto / xmpp): inside a link's text a bare URL is plain text, not
@@ -1278,6 +1513,10 @@ function rewindNodes(nodes, localStart) {
 function tokenizeInline(s, refs, noExt) {
   const nodes = [];
   const n = s.length;
+  // masked source for emStrong scanning (code spans / HTML tags / valid
+  // links replaced by [aaa...]; same length, so indices align with the
+  // raw source)
+  const masked = maskForEm(s, refs);
   let i = 0;
   let textStart = 0;
   const flushText = (end) => {
@@ -1353,22 +1592,18 @@ function tokenizeInline(s, refs, noExt) {
     }
     // emphasis delimiters * _
     if (c === C_STAR || c === C_UNDER) {
-      let j = i;
-      while (j < n && s.charCodeAt(j) === c) j++;
-      const ch = c === C_STAR ? '*' : '_';
-      const fl = flanking(s, i, j);
-      let canOpen, canClose;
-      if (ch === '_') {
-        canOpen = fl.leftFlanking && (!fl.rightFlanking || (i > 0 && isPunctCh(s.charCodeAt(i - 1))));
-        canClose = fl.rightFlanking && (!fl.leftFlanking || (j < n && isPunctCh(s.charCodeAt(j))));
-      } else {
-        canOpen = fl.leftFlanking;
-        canClose = fl.rightFlanking;
+      // marked's emStrong: greedy left-to-right scan from this delimiter.
+      // If it matches, emit the em/strong node and skip past the closer;
+      // otherwise the delimiter is literal text (advance one char).
+      const em = emStrongMatch(s, i, masked, refs, noExt);
+      if (em) {
+        flushText(i);
+        nodes.push(em.node);
+        i = em.end; textStart = i;
+        continue;
       }
-      flushText(i);
-      nodes.push({ t: 1, ch, len: j - i, open: canOpen, close: canClose, p: i });
-      i = j; textStart = i;
-      continue;
+      // literal delimiter char (part of a run that did not pair)
+      i++; continue;
     }
     // image ![
     if (c === C_BANG && i + 1 < n && s.charCodeAt(i + 1) === C_LBR) {
@@ -1506,57 +1741,10 @@ function tokenizeInline(s, refs, noExt) {
 // strikethrough is matched directly during tokenization).
 // Records matches on delimiter nodes, then wraps content into em/strong
 // nodes. Returns the (possibly restructured) node list.
+// Emphasis is now resolved greedily during tokenization by emStrongMatch
+// (marked 18.1.3's emStrong scan), so there are no delimiter nodes left
+// for a post-pass. Kept as a no-op so existing call sites stay valid.
 function processEmphasis(nodes) {
-  const delims = [];
-  for (const nd of nodes) if (nd.t === 1) delims.push(nd);
-  if (delims.length === 0) return nodes;
-
-  const openers = []; // stack of delim nodes that can open
-  for (const d of delims) {
-    if (d.close && d.len > 0) {
-      while (d.len > 0) {
-        let oi = openers.length - 1;
-        let opener = null;
-        while (oi >= 0) {
-          const o = openers[oi];
-          if (o.ch !== d.ch) { oi--; continue; }
-          const oddMatch = (o.open && o.close) || (d.open && d.close);
-          const bothMult3 = o.len % 3 === 0 && d.len % 3 === 0;
-          // rule of 3: when the sum of the two runs is a multiple of 3 and
-          // one of them can both open and close, the pair is skipped —
-          // unless both runs are multiples of 3
-          if (oddMatch && (o.len + d.len) % 3 === 0 && !bothMult3) {
-            oi--; continue;
-          }
-          opener = o;
-          break;
-        }
-        if (!opener) break;
-        const use = (opener.len >= 2 && d.len >= 2) ? 2 : 1;
-        const kind = use === 2 ? 8 : 7;
-        const inner = wrapEmphasis(nodes, opener, d, kind, use);
-        // delimiters now inside the new emphasis span can no longer pair
-        // with a closer outside it: drop them from the opener stack
-        if (inner) {
-          for (const nd of inner) {
-            if (nd.t === 1) {
-              const ix = openers.indexOf(nd);
-              if (ix !== -1) openers.splice(ix, 1);
-            }
-          }
-        }
-        opener.len -= use;
-        d.len -= use;
-        if (opener.len === 0) {
-          const idx = openers.indexOf(opener);
-          if (idx !== -1) openers.splice(idx, 1);
-        }
-      }
-    }
-    if (d.open && d.len > 0) {
-      if (!openers.includes(d)) openers.push(d);
-    }
-  }
   return nodes;
 }
 
