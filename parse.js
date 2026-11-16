@@ -30,6 +30,11 @@ const C_DOT = 46, C_COLON = 58, C_SLASH = 47, C_AT = 64;
 // images are NOT suppressed). HTML blocks do not touch it. Reset at the
 // start of every parse() and before the rendering pass.
 let inLink = false;
+// When true, parseInline is a no-op: the def-collection pass of parse()
+// only needs link reference definitions (collected at block level), so it
+// skips all inline tokenization and rendering — roughly halving total
+// time, since that pass's blocks are discarded.
+let skipInline = false;
 
 // Classify an inline HTML tag: 'open' for <a ...>, 'close' for </a ...>,
 // null otherwise (case-insensitive; <abbr> is not <a>).
@@ -1898,7 +1903,7 @@ function renderInline(nodes, out) {
 
 // Parse inline text to HTML. refs: Map<label, {href, title}>.
 function parseInline(text, refs) {
-  if (text === '') return '';
+  if (text === '' || skipInline) return '';
   const nodes = tokenizeInline(text, refs);
   processEmphasis(nodes);
   const out = [];
@@ -3082,8 +3087,11 @@ export function parse(markdown) {
   // the document (a definition may be used before it appears, cm-214,
   // and marked resolves links only after all blocks are lexed), the
   // second renders with the complete ref map. Definitions are consumed
-  // in both passes; refs.set is idempotent.
+  // in both passes; refs.set is idempotent. The first pass skips inline
+  // tokenization entirely (skipInline) — its blocks are discarded.
+  skipInline = true;
   parseBlocks(lines, refs, null, true, endsNl);
+  skipInline = false;
   inLink = false;
   const blocks = parseBlocks(lines, refs, null, true, endsNl);
   return renderBlocks(blocks, refs);
