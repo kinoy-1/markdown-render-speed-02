@@ -582,15 +582,24 @@ function findLinkEnd(s, i) {
       // the label cannot match and the link FAILS — unless the run is
       // 2+ backticks immediately before `]` (``+(?=])).
       if (run >= 2 && k < n && s.charCodeAt(k) === C_RBR) { j = k; continue; }
+      // The closer run must appear BEFORE the label's closing `]`
+      // (doc-23: a backtick after the `]` is not a closer). Scan for
+      // it tracking bracket depth; a `]` that would close the label
+      // first means the backtick has no closer and the link fails.
       let m = k;
       let found = -1;
+      let d = depth;
       while (m < n) {
-        if (s.charCodeAt(m) === C_BTICK) {
+        const mc = s.charCodeAt(m);
+        if (mc === C_BSLASH && m + 1 < n) { m += 2; continue; }
+        if (mc === C_BTICK) {
           let q = m;
           while (q < n && s.charCodeAt(q) === C_BTICK) q++;
           found = q;
           break;
         }
+        if (mc === C_LBR) d++;
+        else if (mc === C_RBR) { d--; if (d === 0) return -1; }
         m++;
       }
       if (found === -1) return -1;
@@ -895,7 +904,7 @@ function isAutolinkEmail(inner) {
 // Scan an email domain starting at s[j] (just after '@'). Returns the end
 // index (exclusive) or -1. The first label is [a-zA-Z0-9-_]+; later labels
 // are [a-zA-Z0-9-_]*[a-zA-Z0-9] (must end alphanumeric).
-function emailDomainEnd(s, j) {
+function emailDomainEnd(s, j, allowTrail) {
   const n = s.length;
   let k = j;
   while (k < n) {
@@ -915,22 +924,37 @@ function emailDomainEnd(s, j) {
       else break;
     }
     if (m === k + 1) break; // no label after the dot: domain ends here
-    if (lastAlnum !== m - 1) return -1; // label must end alphanumeric
+    if (lastAlnum !== m - 1) {
+      // label ends with _ or - (not alnum). When allowTrail is set,
+      // a trailing run of ONLY '_' is an emphasis delimiter, not part
+      // of the domain: end the label at the last alnum instead of
+      // failing (marked tokenizes the em content separately, so the
+      // closer _ is never part of the email there).
+      if (allowTrail && lastAlnum >= k + 1) {
+        let q = lastAlnum + 1;
+        let allUnder = true;
+        while (q < m) { if (s.charCodeAt(q) !== 95) { allUnder = false; break; } q++; }
+        if (allUnder) { labels++; k = lastAlnum + 1; continue; }
+      }
+      return -1; // label must end alphanumeric
+    }
     labels++;
     k = m;
   }
   if (labels < 2) return -1;
-  // (?![\w-]): the next char must not be a word char or '-'
+  // (?![\w-]): the next char must not be a word char or '-'. A trailing
+  // '_' is allowed only when it's an emphasis delimiter (allowTrail).
   if (k < n) {
     const c = s.charCodeAt(k);
-    if (isAlnumCh(c) || c === 95 || c === 45) return -1;
+    if (isAlnumCh(c) || c === 45) return -1;
+    if (c === 95 && !allowTrail) return -1;
   }
   return k;
 }
 
 // Match an email starting at s[start] (the local part). Returns the end
 // index (exclusive) or -1. Local part: [A-Za-z0-9._+-]+ .
-function matchEmail(s, start) {
+function matchEmail(s, start, allowTrail) {
   const n = s.length;
   let j = start;
   while (j < n) {
@@ -940,7 +964,7 @@ function matchEmail(s, start) {
   }
   if (j === start) return -1;
   if (j >= n || s.charCodeAt(j) !== C_AT) return -1;
-  return emailDomainEnd(s, j + 1);
+  return emailDomainEnd(s, j + 1, allowTrail);
 }
 
 // Scan the local part of an email backwards from the '@' at s[atPos].
@@ -1039,19 +1063,19 @@ function matchHttpPrefix(s, i) {
 
 // Is s[i] the start of an extended autolink (www. / http(s):// / ftp:// /
 // mailto: / xmpp:)? If so, returns {node, end}. Else null.
-function tryExtendedAutolink(s, i) {
+function tryExtendedAutolink(s, i, allowTrail) {
   const n = s.length;
   // mailto: / xmpp: — lowercase only, preceded by a non-alphanumeric
   // (or the start of the string)
   if (i === 0 || !isAlnumCh(s.charCodeAt(i - 1))) {
     if (s.startsWith('mailto:', i)) {
-      const e = matchEmail(s, i + 7);
+      const e = matchEmail(s, i + 7, allowTrail);
       if (e !== -1) {
         const url = s.slice(i, e);
         return { node: { t: 3, href: encodeHref(url), title: null, children: [{ t: 0, s: url, p: i }], p: i }, end: e };
       }
     } else if (s.startsWith('xmpp:', i)) {
-      const e = matchEmail(s, i + 5);
+      const e = matchEmail(s, i + 5, allowTrail);
       if (e !== -1) {
         let end = e;
         // optional single path segment /[A-Za-z0-9@.]+
@@ -1117,11 +1141,11 @@ function tryExtendedAutolink(s, i) {
 // over the raw string (it may reach past delimiter nodes already emitted —
 // the caller rewinds the node list to localStart). Returns
 // {node, end, localStart} or null.
-function tryEmailAutolink(s, i) {
+function tryEmailAutolink(s, i, allowTrail) {
   const n = s.length;
   const ls = emailLocalBack(s, i);
   if (ls === -1) return null;
-  const end = emailDomainEnd(s, i + 1);
+  const end = emailDomainEnd(s, i + 1, allowTrail);
   if (end === -1) return null;
   const email = s.slice(ls, end);
   return { node: { t: 3, href: encodeHref('mailto:' + email), title: null, children: [{ t: 0, s: email, p: ls }], p: ls }, end, localStart: ls };
@@ -1148,7 +1172,7 @@ function isEscapedAt(s, q) {
 
 // Try to match a strikethrough starting at the tilde run s[i..j)
 // (j - i is 1 or 2). Returns {node, end} or null.
-function tryStrikethrough(s, i, j, refs) {
+function tryStrikethrough(s, i, j, refs, noExt) {
   const n = s.length;
   const run = j - i;
   // the character after the opening run must not be a space
@@ -1190,7 +1214,7 @@ function tryStrikethrough(s, i, j, refs) {
                 if (rl === run) lastOk = false;
               }
               if (lastOk) {
-                const children = tokenizeInline(content, refs);
+                const children = tokenizeInline(content, refs, noExt);
                 processEmphasis(children);
                 return { node: { t: 9, children, p: i }, end: q };
               }
@@ -1315,7 +1339,7 @@ function tokenizeInline(s, refs, noExt) {
       let j = i;
       while (j < n && s.charCodeAt(j) === C_TILDE) j++;
       if (j - i <= 2) {
-        const d = tryStrikethrough(s, i, j, refs);
+        const d = tryStrikethrough(s, i, j, refs, noExt);
         if (d) {
           flushText(i);
           nodes.push(d.node);
@@ -1417,7 +1441,16 @@ function tokenizeInline(s, refs, noExt) {
     // also disabled while inside an unclosed <a> tag, marked's
     // document-persistent inLink state)
     if (!noExt && !inLink && ((c >= 97 && c <= 122) || (c >= 65 && c <= 90))) { // a letter
-      const a = tryExtendedAutolink(s, i);
+      // Is there an unmatched '_' opener before this point? If so, a
+      // trailing '_' after an email domain is an emphasis delimiter,
+      // not part of the domain (marked tokenizes em content
+      // separately). Compute once per branch entry.
+      let allowTrail = false;
+      for (let q = 0; q < nodes.length; q++) {
+        const nd = nodes[q];
+        if (nd.t === 1 && nd.ch === '_' && nd.open) { allowTrail = true; break; }
+      }
+      const a = tryExtendedAutolink(s, i, allowTrail);
       if (a) {
         flushText(i);
         nodes.push(a.node);
@@ -1430,7 +1463,12 @@ function tokenizeInline(s, refs, noExt) {
     // email autolink at @ (disabled inside link text; also disabled
     // while inside an unclosed <a> tag, marked's inLink state)
     if (!noExt && !inLink && c === C_AT) {
-      const e = tryEmailAutolink(s, i);
+      let allowTrail = false;
+      for (let q = 0; q < nodes.length; q++) {
+        const nd = nodes[q];
+        if (nd.t === 1 && nd.ch === '_' && nd.open) { allowTrail = true; break; }
+      }
+      const e = tryEmailAutolink(s, i, allowTrail);
       if (e) {
         if (e.localStart < textStart) rewindNodes(nodes, e.localStart);
         else flushText(e.localStart);
@@ -2009,22 +2047,24 @@ function tableBodyEnds(line) {
 // ---------------------------------------------------------------------------
 
 // Remove up to n leading spaces from a line (after expanding leading
-// tabs to spaces). Used for fenced-code indent compensation: the opening
-// fence's indent is stripped from every content line, but never more
-// than the line actually has.
+// Strip up to n columns of indent from a line (spaces and tabs).
+// Used ONLY for fenced-code indent compensation. A tab that straddles
+// the boundary is dropped ENTIRELY (marked keeps no remainder spaces
+// for fences — `   ```toml` + `\tindented` renders `indented`, not
+// ` indented`); this differs from indented-code stripping, which
+// keeps the remainder.
 function stripUpTo(line, n) {
   if (n <= 0) return line;
-  let col = 0, i = 0, out = '';
+  let col = 0, i = 0;
   while (i < line.length && col < n) {
     const c = line.charCodeAt(i);
     if (c === C_SPACE) { col++; i++; }
     else if (c === C_TAB) {
       const nx = col + (4 - (col % 4));
-      if (nx <= n) { col = nx; i++; }
-      else { out += ' '.repeat(nx - n); col = n; i++; }
+      col = nx; i++;
     } else break;
   }
-  return out + line.slice(i);
+  return line.slice(i);
 }
 
 // Strip one blockquote marker from a line. Returns {had, text} where text
@@ -2315,8 +2355,11 @@ function parseBlocks(lines, refs, lazy, topLevel, endsNl, inList) {
       // lang is NOT &amp;-escaped (entities stay as-is, cm-034)
       const lang = info ? escapeInfo(info.split(/\s+/)[0]) : '';
       // marked's indent compensation: the opening fence's indent is
-      // stripped from every content line
-      const findent = indentCols(line);
+      // stripped from every content line — but ONLY for backtick
+      // fences. Tilde fences keep their content indent verbatim in
+      // marked (verified: `  ~~~js` keeps `  code`, while the same
+      // backtick fence strips to `code`).
+      const findent = fence.char === C_BTICK ? indentCols(line) : 0;
       const stripped = findent > 0 ? content.map(l => stripUpTo(l, findent)) : content;
       // marked's code renderer: strip one trailing newline from the token
       // text (the fence regex already excludes the newline before the
@@ -2368,17 +2411,12 @@ function parseBlocks(lines, refs, lazy, topLevel, endsNl, inList) {
       // that ends at a blank line has NO trailing newline; one that ends
       // mid-document keeps it (more lines follow); one that ends at EOF
       // keeps it only when the source ends with a newline (gfm-657).
-      // "Blank" here is empty-or-spaces-only: a TAB-only line is NOT
-      // blank for this purpose (doc-15: a `\t` after a comment keeps
-      // the block's trailing newline).
+      // "Blank" here is ONLY a truly empty line: a spaces-only or
+      // tab-only line after the block does NOT strip the trailing
+      // newline (doc-19: `   ` after `-->` keeps `\n`; doc-15: `\t`
+      // after `-->` keeps `\n`).
       const nextLine = j < lines.length ? lines[j] : null;
-      let endedAtBlank = false;
-      if (nextLine !== null) {
-        endedAtBlank = true;
-        for (let k = 0; k < nextLine.length; k++) {
-          if (nextLine.charCodeAt(k) !== C_SPACE) { endedAtBlank = false; break; }
-        }
-      }
+      const endedAtBlank = nextLine !== null && nextLine === '';
       const keepNl = !endedAtBlank && (j < lines.length || endsNl);
       out.push({ k: 'x', s: htmlLines.join('\n') + (keepNl ? '\n' : '') });
       i = j;
@@ -2565,15 +2603,31 @@ function parseList(lines, start, refs) {
     // every line is fence content (even at column 0) until the closing
     // fence (doc-02: `function f(a, b) {` inside a ```css block).
     // The fence may open on the item's first line (cm-318: `- ```).
+    // BUT the FIRST content line after the fence opens must be
+    // indented to the item's content level (or blank); a column-0
+    // line right after the opening fence is NOT part of the item, so
+    // the fence is EMPTY and the line starts a new top-level block
+    // (doc-17: `   ```toml` followed by `if my-package previous` at
+    // column 0). Once the fence has absorbed one content line, later
+    // column-0 lines ARE fence content (doc-02).
     let fence = fenceStart(fc.text);
+    let fenceHasContent = false;
     let j = i + 1;
     while (j < lines.length) {
       const l2 = lines[j];
       if (fence) {
+        // The first content line must be indented to the item level
+        // (or blank / the closing fence); otherwise the fence is
+        // empty and this line ends the item (doc-17).
+        if (!fenceHasContent && !isBlank(l2) && !isFenceEnd(l2, fence) && indentCols(l2) < contentIndent) {
+          fence = null;
+          break;
+        }
         // fence content: blank lines included, indent stripped when present
         const stripped = indentCols(l2) >= contentIndent ? stripColumnsExpanded(l2, contentIndent) : l2;
         itemLines.push(stripped); itemLazy.push(false); j++;
         if (isFenceEnd(stripped, fence)) fence = null;
+        else fenceHasContent = true;
         continue;
       }
       if (isBlank(l2)) {
