@@ -2191,6 +2191,12 @@ function isContinuationLine(line) {
   if (fenceStart(line)) return false;
   if (paragraphHtmlInterrupt(line)) return false;
   if (listMarker(line)) return false;
+  // a blockquote marker (up to 3 spaces + >) starts a new block, it is
+  // never a lazy continuation of a paragraph (doc-17: `    > not a
+  // quote` at indent 4 ends the inner list item, it is not absorbed)
+  let p = 0;
+  while (p < line.length && p < 3 && line.charCodeAt(p) === C_SPACE) p++;
+  if (p < line.length && line.charCodeAt(p) === C_GT) return false;
   return true;
 }
 
@@ -2411,12 +2417,15 @@ function parseBlocks(lines, refs, lazy, topLevel, endsNl, inList) {
       // that ends at a blank line has NO trailing newline; one that ends
       // mid-document keeps it (more lines follow); one that ends at EOF
       // keeps it only when the source ends with a newline (gfm-657).
-      // "Blank" here is ONLY a truly empty line: a spaces-only or
-      // tab-only line after the block does NOT strip the trailing
-      // newline (doc-19: `   ` after `-->` keeps `\n`; doc-15: `\t`
-      // after `-->` keeps `\n`).
+      // "Blank" depends on the block type: for types 1-5 (pre/script/
+      // style/textarea, comments, PI, declarations, CDATA) ONLY a truly
+      // empty line strips the newline — a spaces-only or tab-only line
+      // after the block does NOT (doc-19: `   ` after `-->` keeps `\n`;
+      // doc-15: `\t` after `-->` keeps `\n`). For types 6-7 (block
+      // tags) a spaces-only line IS blank and strips it (doc-18:
+      // `   ` after `</details>` gives `</details><p>`).
       const nextLine = j < lines.length ? lines[j] : null;
-      const endedAtBlank = nextLine !== null && nextLine === '';
+      const endedAtBlank = nextLine !== null && (htype >= 6 ? isBlank(nextLine) : nextLine === '');
       const keepNl = !endedAtBlank && (j < lines.length || endsNl);
       out.push({ k: 'x', s: htmlLines.join('\n') + (keepNl ? '\n' : '') });
       i = j;
